@@ -1,12 +1,14 @@
 package wtf.nbd.obw
 
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.Future
+import scala.util.{Failure, Success}
 import android.os.Bundle
 import android.view.View
 import android.widget.{LinearLayout, TextView}
 import androidx.appcompat.app.AlertDialog
-import wtf.nbd.obw.BaseActivity.StringOps
-import wtf.nbd.obw.R
 import com.ornach.nobobutton.NoboButton
+import org.apmem.tools.layouts.FlowLayout
 import fr.acinq.bitcoin.Crypto.PublicKey
 import fr.acinq.bitcoin._
 import fr.acinq.eclair.Features._
@@ -25,18 +27,15 @@ import immortan._
 import immortan.crypto.Tools._
 import immortan.fsm.{HCOpenHandler, NCFundeeOpenHandler, NCFunderOpenHandler}
 import immortan.utils._
-import org.apmem.tools.layouts.FlowLayout
-import rx.lang.scala.Observable
-
-import scala.concurrent.ExecutionContext.Implicits.global
-import scala.concurrent.Future
-import scala.util.{Failure, Success}
+import wtf.nbd.obw.BaseActivity.StringOps
+import wtf.nbd.obw.R
+import wtf.nbd.obw.utils.{firstLast}
 
 object RemotePeerActivity {
   def implantNewChannel(cs: Commitments, freshChannel: Channel): Unit = {
     // Make an immediate channel backup if anything goes wrong next
     // At this point channel has saved itself in the database
-    WalletApp.backupSaveWorker.replaceWork(false)
+    WalletApp.immediatelySaveBackup
 
     LNParams.cm.pf.process(PathFinder.CMDStartPeriodicResync)
     LNParams.cm.all += Tuple2(cs.channelId, freshChannel)
@@ -248,12 +247,15 @@ class RemotePeerActivity
     ): Runnable = UITask {
       // At this point we have a real signed funding, relay it to channel and indicate progress
       sendView.switchToSpinner(alert)
-      channel process response
+      channel.process(response)
     }
 
     def attempt(alert: AlertDialog): Unit = {
-      def revertInformDismiss(reason: Throwable): Unit =
-        runAnd(alert.dismiss)(revertAndInform(reason))
+      def revertInformDismiss(reason: Throwable): Unit = {
+        revertAndInform(reason)
+        alert.dismiss
+      }
+
       runFutureProcessOnUI(
         makeFakeFunding(
           sendView.manager.resultMsat.truncateToSatoshi,
@@ -281,7 +283,9 @@ class RemotePeerActivity
             override def onChanPersisted(
                 data: DATA_WAIT_FOR_FUNDING_CONFIRMED,
                 chan: ChannelNormal
-            ): Unit = implantAndBroadcast(data, fromWallet, chan)
+            ): Unit =
+              implantAndBroadcast(data, fromWallet, chan)
+
             override def onFailure(reason: Throwable): Unit =
               revertInformDismiss(reason)
 
@@ -382,29 +386,29 @@ class RemotePeerActivity
     }
 
     lazy val feeView =
-      new FeeView[GenerateTxResponse](FeeratePerByte(1L.sat), sendView.body) {
+      new FeeView(FeeratePerByte(1L.sat), sendView.body) {
         rate =
           LNParams.feeRates.info.onChainFeeConf.feeEstimator.getFeeratePerKw(
             LNParams.feeRates.info.onChainFeeConf.feeTargets.fundingBlockTarget
           )
 
-        worker = new ThrottledWork[String, GenerateTxResponse] {
-          def process(
-              reason: String,
-              responseResult: GenerateTxResponse
-          ): Unit = update(
-            feeOpt = Some(responseResult.fee.toMilliSatoshi),
-            showIssue = false
-          )
-          def work(reason: String): Observable[GenerateTxResponse] =
-            Rx fromFutureOnIo makeFakeFunding(
-              sendView.manager.resultMsat.truncateToSatoshi,
-              rate
-            )
-          override def error(exc: Throwable): Unit = update(
-            feeOpt = None,
-            showIssue = sendView.manager.resultMsat >= LNParams.minChanDustLimit
-          )
+        val onChange = firstLast[Unit] { _ =>
+          makeFakeFunding(
+            sendView.manager.resultMsat.truncateToSatoshi,
+            rate
+          ).onComplete {
+            case Success(res) =>
+              update(
+                feeOpt = Some(res.fee.toMilliSatoshi),
+                showIssue = false
+              )
+            case Failure(_) =>
+              update(
+                feeOpt = None,
+                showIssue =
+                  sendView.manager.resultMsat >= LNParams.minChanDustLimit
+              )
+          }
         }
 
         override def update(
@@ -417,8 +421,8 @@ class RemotePeerActivity
       }
 
     // Automatically update a candidate transaction each time user changes amount value
-    sendView.manager.inputAmount addTextChangedListener onTextChange(
-      feeView.worker.addWork
+    sendView.manager.inputAmount.addTextChangedListener(
+      onTextChange(_ => feeView.onChange(()))
     )
     feeView.update(feeOpt = None, showIssue = false)
   }
@@ -490,8 +494,14 @@ class RemotePeerActivity
   def revertAndInform(reason: Throwable): Unit = UITask {
     setVis(isVisible = criticalSupportAvailable, viewYesFeatureSupport)
     CommsTower.listenNative(Set(incomingAcceptingListener), hasInfo.remoteInfo)
-    val details = Option(reason.getMessage).getOrElse(reason.stackTraceAsString)
-    WalletApp.app.quickToast(details)
+    val details = Option(reason.getMessage)
+      .orElse(reason.toString() match {
+        case null => None
+        case ""   => None
+        case str  => Some(str)
+      })
+      .getOrElse(reason.stackTraceAsString)
+    onFail(details)
   }.run
 
   def stopAcceptingIncomingOffers(): Unit = {

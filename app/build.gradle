@@ -5,6 +5,12 @@ android {
     compileSdkVersion 29
     buildToolsVersion "29.0.3"
 
+    android {
+        packagingOptions {
+            doNotStrip '**/*.so'
+        }
+    }
+
     defaultConfig {
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
         applicationId 'wtf.nbd.obw'
@@ -12,8 +18,8 @@ android {
         targetSdkVersion 31
         minSdkVersion 26
 
-        versionName '0.1.5'
-        versionCode 6
+        versionName '0.2.1'
+        versionCode 12
     }
 
     dexOptions {
@@ -43,11 +49,20 @@ android {
             proguardFiles 'proguard-rules.pro'
             signingConfig signingConfigs.debug
             applicationIdSuffix ".dev"
+            buildConfigField "String", "CHAIN", '"mainnet"'
+        }
+        signet {
+            minifyEnabled false
+            proguardFiles 'proguard-rules.pro'
+            signingConfig signingConfigs.debug
+            applicationIdSuffix ".signet"
+            buildConfigField "String", "CHAIN", '"signet"'
         }
         release {
             minifyEnabled false
             proguardFiles 'proguard-rules.pro'
             signingConfig signingConfigs.debug
+            buildConfigField "String", "CHAIN", '"mainnet"'
             if (project.hasProperty('STORE_FILE')) {
                 signingConfig signingConfigs.release
             }
@@ -83,8 +98,6 @@ tasks.withType(ScalaCompile) {
             "-language:higherKinds", // Allow higher-kinded types
             "-language:implicitConversions", // Allow definition of implicit functions called views
             "-unchecked", // Enable additional warnings where generated code depends on assumptions.
-            "-Xcheckinit", // Wrap field accessors to throw an exception on uninitialized access.
-            // "-Xfatal-warnings", // Fail the compilation if there are any warnings.
             "-Xlint:adapted-args", // Warn if an argument list is modified to match the receiver.
             "-Xlint:constant", // Evaluation of a constant arithmetic expression results in an error.
             "-Xlint:delayedinit-select", // Selecting member of DelayedInit.
@@ -151,7 +164,7 @@ dependencies {
     implementation 'org.scala-lang:scala-library:2.13.8'
 
     // Related to Immortan
-    implementation 'com.fiatjaf:immortan_2.13:0.7.9-SNAPSHOT'
+    implementation 'com.fiatjaf:immortan_2.13:0.7.12'
     implementation 'fr.acinq.secp256k1:secp256k1-kmp-jni-android:0.6.4'
 
     // Built-in Tor

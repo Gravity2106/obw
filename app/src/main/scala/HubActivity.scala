@@ -1,13 +1,13 @@
 package wtf.nbd.obw
 
-import java.util.TimerTask
+import java.util.{TimerTask, Date}
 import scala.util.chaining._
 import scala.jdk.CollectionConverters._
 import scala.collection.immutable.Seq
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 import scala.concurrent.{Await, Future}
-import scala.util.{Success, Try}
+import scala.util.{Success, Failure, Try}
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
 import android.graphics.{Bitmap, BitmapFactory}
@@ -20,7 +20,7 @@ import androidx.transition.TransitionManager
 import wtf.nbd.obw.BaseActivity.StringOps
 import wtf.nbd.obw.HubActivity._
 import wtf.nbd.obw.R
-import wtf.nbd.obw.utils.LocalBackup
+import wtf.nbd.obw.utils.{LocalBackup, firstLast, debounce}
 import com.chauthai.swipereveallayout.{SwipeRevealLayout, ViewBinderHelper}
 import com.danilomendes.progressbar.InvertedTextProgressbar
 import com.github.mmin18.widget.RealtimeBlurView
@@ -37,13 +37,11 @@ import fr.acinq.bitcoin._
 import fr.acinq.eclair._
 import fr.acinq.eclair.blockchain.electrum.ElectrumWallet.{
   GenerateTxResponse,
-  RBFResponse,
   WalletReady
 }
 import fr.acinq.eclair.blockchain.electrum.{
   ElectrumEclairWallet,
-  ElectrumWallet,
-  TxConfirmedAt
+  ElectrumWallet
 }
 import fr.acinq.eclair.blockchain.fee.FeeratePerByte
 import fr.acinq.eclair.channel._
@@ -65,7 +63,7 @@ import immortan.utils._
 import org.apmem.tools.layouts.FlowLayout
 import org.ndeftools.Message
 import org.ndeftools.util.activity.NfcReaderActivity
-import rx.lang.scala.{Observable, Subscription}
+import rx.lang.scala.Subscription
 
 object HubActivity {
   var txInfos: Iterable[TxInfo] = Nil
@@ -102,6 +100,23 @@ object HubActivity {
   )
   def itemsLength: Int =
     txInfos.size + paymentInfos.size + lnUrlPayLinks.size + relayedPreimageInfos.size
+
+  def getNameFromNameDesc(text: String): Option[String] = {
+    val spl = text.split(":  ")
+    spl.size match {
+      case 1                       => None
+      case _ if spl.head.size < 30 => Some(spl.head)
+      case _                       => None
+    }
+  }
+
+  def expellNameFromNameDesc(text: String): String = {
+    val spl = text.split(":  ")
+    spl.size match {
+      case 1 => text
+      case _ => spl.drop(1).mkString(": ")
+    }
+  }
 }
 
 class HubActivity
@@ -227,14 +242,13 @@ class HubActivity
     updAllInfos()
   }
 
-  val searchWorker: ThrottledWork[String, Unit] =
-    new ThrottledWork[String, Unit] {
-      def work(query: String): Observable[Unit] = Rx.ioQueue.map(_ =>
-        if (query.nonEmpty) loadSearch(query) else loadRecent()
-      )
-      def process(userTypedQuery: String, searchLoadResultEffect: Unit): Unit =
-        paymentAdapterDataChanged.run
-    }
+  val search = debounce[String](
+    query => {
+      if (query.nonEmpty) loadSearch(query) else loadRecent()
+      paymentAdapterDataChanged.run
+    },
+    350.milliseconds
+  )
 
   val payLinkImageMemo: LoadingCache[Array[Byte], Bitmap] = memoize { bytes =>
     BitmapFactory.decodeByteArray(bytes, 0, bytes.length)
@@ -689,23 +703,25 @@ class HubActivity
       val target = LNParams.feeRates.info.onChainFeeConf.feeEstimator
         .getFeeratePerKw(blockTarget)
       lazy val feeView =
-        new FeeView[GenerateTxResponse](FeeratePerByte(target), body) {
+        new FeeView(FeeratePerByte(target), body) {
           rate = target
 
-          worker = new ThrottledWork[String, GenerateTxResponse] {
-            def work(reason: String): Observable[GenerateTxResponse] =
-              Rx fromFutureOnIo fromWallet.makeCPFP(
+          val onChange = firstLast[Unit] { _ =>
+            fromWallet
+              .makeCPFP(
                 fromOutPoints.toSet,
                 chainPubKeyScript,
                 rate
               )
-            def process(reason: String, response: GenerateTxResponse): Unit =
-              update(
-                feeOpt = Some(response.fee.toMilliSatoshi),
-                showIssue = false
-              )
-            override def error(exc: Throwable): Unit =
-              update(feeOpt = None, showIssue = true)
+              .onComplete {
+                case Success(res) =>
+                  update(
+                    feeOpt = Some(res.fee.toMilliSatoshi),
+                    showIssue = false
+                  )
+                case Failure(_) =>
+                  update(feeOpt = None, showIssue = true)
+              }
           }
 
           override def update(
@@ -819,28 +835,33 @@ class HubActivity
         LNParams.feeRates.info.onChainFeeConf.feeTargets.fundingBlockTarget
       val target = LNParams.feeRates.info.onChainFeeConf.feeEstimator
         .getFeeratePerKw(blockTarget)
-      lazy val feeView: FeeView[RBFResponse] =
-        new FeeView[RBFResponse](FeeratePerByte(target), body) {
+      lazy val feeView: FeeView =
+        new FeeView(FeeratePerByte(target), body) {
           rate = target
 
-          worker = new ThrottledWork[String, RBFResponse] {
-            def process(reason: String, response: RBFResponse): Unit =
-              response.result match {
-                case Left(ElectrumWallet.PARENTS_MISSING) =>
-                  showRbfErrorDesc(R.string.tx_rbf_err_parents_missing)
-                case Left(ElectrumWallet.FOREIGN_INPUTS) =>
-                  showRbfErrorDesc(R.string.tx_rbf_err_foreign_inputs)
-                case Left(ElectrumWallet.RBF_DISABLED) =>
-                  showRbfErrorDesc(R.string.tx_rbf_err_rbf_disabled)
-                case Right(res) =>
-                  update(Some(res.fee.toMilliSatoshi), showIssue = false)
-                case _ => error(new RuntimeException)
+          val onChange = firstLast[Unit] { _ =>
+            fromWallet
+              .makeRBFBump(info.tx, rate)
+              .onComplete {
+                case Success(res) =>
+                  res.result match {
+                    case Left(ElectrumWallet.PARENTS_MISSING) =>
+                      showRbfErrorDesc(R.string.tx_rbf_err_parents_missing)
+                    case Left(ElectrumWallet.FOREIGN_INPUTS) =>
+                      showRbfErrorDesc(R.string.tx_rbf_err_foreign_inputs)
+                    case Left(ElectrumWallet.RBF_DISABLED) =>
+                      showRbfErrorDesc(R.string.tx_rbf_err_rbf_disabled)
+                    case Right(res) =>
+                      update(
+                        Some(res.fee.toMilliSatoshi),
+                        showIssue = false
+                      )
+                    case _ =>
+                      update(feeOpt = None, showIssue = true)
+                  }
+                case Failure(_) =>
+                  update(feeOpt = None, showIssue = true)
               }
-
-            def work(reason: String): Observable[RBFResponse] =
-              Rx fromFutureOnIo fromWallet.makeRBFBump(info.tx, rate)
-            override def error(exc: Throwable): Unit =
-              update(feeOpt = None, showIssue = true)
           }
 
           private def showRbfErrorDesc(descRes: Int): Unit = UITask {
@@ -913,7 +934,7 @@ class HubActivity
       rbfCurrent.secondItem.setText(currentFee.html)
       feeView.update(feeOpt = None, showIssue = false)
       feeView.customFeerateOption.performClick
-      feeView.worker addWork "RBF-INIT-CALL"
+      feeView.onChange(())
     }
 
     def cancelRBF(info: TxInfo): Unit =
@@ -952,32 +973,37 @@ class HubActivity
         LNParams.feeRates.info.onChainFeeConf.feeTargets.fundingBlockTarget
       val target = LNParams.feeRates.info.onChainFeeConf.feeEstimator
         .getFeeratePerKw(blockTarget)
-      lazy val feeView: FeeView[RBFResponse] =
-        new FeeView[RBFResponse](FeeratePerByte(target), body) {
+      lazy val feeView: FeeView =
+        new FeeView(FeeratePerByte(target), body) {
           rate = target
 
-          worker = new ThrottledWork[String, RBFResponse] {
-            def process(reason: String, response: RBFResponse): Unit =
-              response.result match {
-                case Left(ElectrumWallet.PARENTS_MISSING) =>
-                  showRbfErrorDesc(R.string.tx_rbf_err_parents_missing)
-                case Left(ElectrumWallet.FOREIGN_INPUTS) =>
-                  showRbfErrorDesc(R.string.tx_rbf_err_foreign_inputs)
-                case Left(ElectrumWallet.RBF_DISABLED) =>
-                  showRbfErrorDesc(R.string.tx_rbf_err_rbf_disabled)
-                case Right(res) =>
-                  update(Some(res.fee.toMilliSatoshi), showIssue = false)
-                case _ => error(new RuntimeException)
-              }
-
-            def work(reason: String): Observable[RBFResponse] =
-              Rx fromFutureOnIo fromWallet.makeRBFReroute(
+          val onChange = firstLast[Unit] { _ =>
+            fromWallet
+              .makeRBFReroute(
                 info.tx,
                 rate,
                 changePubKeyScript
               )
-            override def error(exception: Throwable): Unit =
-              update(feeOpt = None, showIssue = true)
+              .onComplete {
+                case Success(res) =>
+                  res.result match {
+                    case Left(ElectrumWallet.PARENTS_MISSING) =>
+                      showRbfErrorDesc(R.string.tx_rbf_err_parents_missing)
+                    case Left(ElectrumWallet.FOREIGN_INPUTS) =>
+                      showRbfErrorDesc(R.string.tx_rbf_err_foreign_inputs)
+                    case Left(ElectrumWallet.RBF_DISABLED) =>
+                      showRbfErrorDesc(R.string.tx_rbf_err_rbf_disabled)
+                    case Right(res) =>
+                      update(
+                        Some(res.fee.toMilliSatoshi),
+                        showIssue = false
+                      )
+                    case _ =>
+                      update(feeOpt = None, showIssue = true)
+                  }
+                case Failure(_) =>
+                  update(feeOpt = None, showIssue = true)
+              }
           }
 
           private def showRbfErrorDesc(descRes: Int): Unit = UITask {
@@ -1049,7 +1075,7 @@ class HubActivity
       rbfCurrent.secondItem.setText(currentFee.html)
       feeView.update(feeOpt = None, showIssue = false)
       feeView.customFeerateOption.performClick
-      feeView.worker addWork "RBF-INIT-CALL"
+      feeView.onChange(())
     }
 
     // VIEW RELATED
@@ -1057,6 +1083,11 @@ class HubActivity
       setVis(isVisible = false, extraInfo)
       extraInfo.removeAllViewsInLayout
       openListItems -= item.identity
+      currentDetails match {
+        case info: PaymentInfo =>
+          description.setText(paymentDescription(info).html)
+        case _ =>
+      }
       description.setMaxLines(1)
     }
 
@@ -1064,6 +1095,13 @@ class HubActivity
       setVis(isVisible = true, extraInfo)
       extraInfo.removeAllViewsInLayout
       openListItems += item.identity
+      currentDetails match {
+        case info: PaymentInfo =>
+          description.setText(
+            expellNameFromNameDesc(paymentDescription(info)).html
+          )
+        case _ =>
+      }
       description.setMaxLines(3)
 
       item match {
@@ -1086,6 +1124,12 @@ class HubActivity
             amount,
             Denomination.formatFiatShort
           )
+          val fiatNowDouble = WalletApp
+            .msatInFiat(
+              LNParams.fiatRates.info.rates,
+              WalletApp.fiatCode
+            )(amount)
+            .getOrElse(0.0)
 
           val liveFeePaid =
             outgoingFSMOpt.map(_.data.usedFee).getOrElse(info.fee)
@@ -1099,12 +1143,21 @@ class HubActivity
           val shouldRetry =
             info.status == PaymentStatus.ABORTED && !info.prExt.pr
               .isExpired() && info.description.split.isEmpty && info.description.toSelfPreimage.isEmpty
-          val shouldShowPayee =
-            !info.isIncoming && info.description.toSelfPreimage.isEmpty
+
+          info.description.externalInfo
+            .flatMap(getNameFromNameDesc(_))
+            .foreach { name =>
+              addFlowChip(
+                extraInfo,
+                getString(R.string.popup_ln_namedesc).format(name),
+                R.drawable.border_white,
+                Some(name)
+              )
+            }
 
           addFlowChip(
             extraInfo,
-            getString(R.string.popup_hash) format info.paymentHash.toHex.short,
+            getString(R.string.popup_hash).format(info.paymentHash.toHex.short),
             R.drawable.border_green,
             Some(info.paymentHash.toHex)
           )
@@ -1114,7 +1167,7 @@ class HubActivity
               extraInfo,
               getString(
                 R.string.popup_preimage
-              ) format info.preimage.toHex.short,
+              ).format(info.preimage.toHex.short),
               R.drawable.border_yellow,
               Some(info.preimage.toHex)
             )
@@ -1141,22 +1194,15 @@ class HubActivity
                 )
             )
 
-          if (shouldShowPayee)
+          if (fiatNowDouble > 0.09) {
             addFlowChip(
               extraInfo,
-              getString(
-                R.string.popup_ln_payee
-              ) format info.prExt.pr.nodeId.toString.short,
-              R.drawable.border_white,
-              Some(info.prExt.pr.nodeId.toString)
+              getString(R.string.popup_fiat)
+                .format(fiatNow, fiatThen),
+              R.drawable.border_white
             )
+          }
 
-          addFlowChip(
-            extraInfo,
-            getString(R.string.popup_fiat)
-              .format(fiatNow, fiatThen),
-            R.drawable.border_white
-          )
           // remove this "prior balance" thing until we understand and fix it
           // addFlowChip(
           //   extraInfo,
@@ -1164,6 +1210,7 @@ class HubActivity
           //     .parsedWithSign(info.balanceSnapshot),
           //   R.drawable.border_white
           // )
+
           if (info.isIncoming && info.status == PaymentStatus.PENDING)
             addFlowChip(
               extraInfo,
@@ -1271,36 +1318,39 @@ class HubActivity
             amount,
             Denomination.formatFiat
           )
+          val fiatNowDouble = WalletApp
+            .msatInFiat(
+              LNParams.fiatRates.info.rates,
+              WalletApp.fiatCode
+            )(amount)
+            .getOrElse(0.0)
+
           // val balanceSnapshot =
           //   WalletApp.denom.parsedWithSign(info.balanceSnapshot)
 
           addFlowChip(
             extraInfo,
-            getString(R.string.popup_txid) format info.txidString.short,
+            getString(R.string.popup_txid).format(info.txidString.short),
             R.drawable.border_green,
             Some(info.txidString)
           )
           for (address <- info.description.toAddress)
             addFlowChip(
               extraInfo,
-              getString(R.string.popup_to_address) format address.short,
+              getString(R.string.popup_to_address).format(address.short),
               R.drawable.border_yellow,
               Some(address)
             )
-          for (nodeId <- info.description.withNodeId)
+
+          if (fiatNowDouble > 0.09) {
             addFlowChip(
               extraInfo,
-              getString(R.string.popup_ln_node) format nodeId.toString.short,
-              R.drawable.border_white,
-              Some(nodeId.toString)
+              getString(R.string.popup_fiat)
+                .format(fiatNow, fiatThen),
+              R.drawable.border_white
             )
+          }
 
-          addFlowChip(
-            extraInfo,
-            getString(R.string.popup_fiat)
-              .format(fiatNow, fiatThen),
-            R.drawable.border_white
-          )
           // remove this "prior balance" thing until we understand and fix it
           // if (info.description.cpfpOf.isEmpty && info.description.rbf.isEmpty)
           //   addFlowChip(
@@ -1315,7 +1365,7 @@ class HubActivity
           )
             addFlowChip(
               extraInfo,
-              getString(R.string.popup_chain_fee) format fee,
+              getString(R.string.popup_chain_fee).format(fee),
               R.drawable.border_white
             )
 
@@ -1346,12 +1396,12 @@ class HubActivity
             WalletApp.denom.parsedWithSign(info.relayed)
           addFlowChip(
             extraInfo,
-            getString(R.string.popup_hash) format info.paymentHashString.short,
+            getString(R.string.popup_hash).format(info.paymentHashString.short),
             R.drawable.border_green
           )
           addFlowChip(
             extraInfo,
-            getString(R.string.stats_item_relayed) format relayedHuman,
+            getString(R.string.stats_item_relayed).format(relayedHuman),
             R.drawable.border_white
           )
 
@@ -1397,7 +1447,7 @@ class HubActivity
             .html
         )
         description.setText(
-          info.description.label getOrElse txDescription(info).html
+          info.description.label.getOrElse(txDescription(info).html)
         )
         swipeWrap.setLockDrag(false)
         setTxTypeIcon(info)
@@ -1426,7 +1476,12 @@ class HubActivity
             )
             .html
         )
-        description.setText(paymentDescription(info).html)
+
+        val desc =
+          if (isVisible(extraInfo))
+            expellNameFromNameDesc(paymentDescription(info))
+          else paymentDescription(info)
+        description.setText(desc.html)
         swipeWrap.setLockDrag(false)
 
       case info: DelayedRefunds =>
@@ -1932,7 +1987,6 @@ class HubActivity
       UITask {
         val assistedShortIds =
           data.cmd.assistedEdges.map(_.updExt.update.shortChannelId)
-        val isIncompleteGraph = LNParams.cm.pf.isIncompleteGraph
         val canIncreaseFee =
           data.cmd.split.myPart + data.cmd.totalFeeReserve * 2 <= LNParams.cm
             .maxSendable(LNParams.cm.all.values)
@@ -1961,7 +2015,7 @@ class HubActivity
             }
           }
 
-        if (isIncompleteGraph && warnNoRouteFound)
+        if (LNParams.cm.pf.isIncompleteGraph && warnNoRouteFound)
           snack(
             contentWindow,
             getString(R.string.ln_sync_not_complete),
@@ -2095,8 +2149,9 @@ class HubActivity
 
   // Getting graph sync status and our peer announcements
   override def process(reply: Any): Unit = reply match {
-    case na: NodeAnnouncement =>
-      LNParams.cm.all.values.foreach(_.process(na.toRemoteInfo))
+    case na: NodeAnnouncement
+        if na.timestamp > ((new Date().getTime() / 1000) - 60 * 60 * 24 * 30) =>
+      LNParams.cm.all.values.foreach(_.process(na))
     case PathFinder.CMDResync =>
       walletCards.updateLnSyncProgress(total = 1000, left = 1000)
     case prd: PureRoutingData =>
@@ -2203,7 +2258,8 @@ class HubActivity
 
               override val alert: AlertDialog = {
                 val title = new TitleView(
-                  getString(R.string.dialog_split_ln) format prExt.brDescription
+                  getString(R.string.dialog_split_ln)
+                    .format(prExt.descriptionOpt.getOrElse(""))
                 )
                 val builder = titleBodyAsViewBuilder(
                   title.asColoredView(R.color.ourPurple),
@@ -2211,14 +2267,20 @@ class HubActivity
                 )
                 addFlowChip(
                   title.flow,
-                  getString(R.string.dialog_ln_requested) format WalletApp.denom
-                    .parsedWithSign(origAmount),
+                  getString(R.string.dialog_ln_requested)
+                    .format(
+                      WalletApp.denom
+                        .parsedWithSign(origAmount)
+                    ),
                   R.drawable.border_white
                 )
                 addFlowChip(
                   title.flow,
-                  getString(R.string.dialog_ln_left) format WalletApp.denom
-                    .parsedWithSign(prExt.splitLeftover),
+                  getString(R.string.dialog_ln_left)
+                    .format(
+                      WalletApp.denom
+                        .parsedWithSign(prExt.splitLeftover)
+                    ),
                   R.drawable.border_white
                 )
                 mkCheckFormNeutral(
@@ -2256,7 +2318,12 @@ class HubActivity
                 val totalHuman =
                   WalletApp.denom.parsedWithSign(origAmount)
                 val title = new TitleView(
-                  getString(R.string.dialog_send_ln) format prExt.brDescription
+                  getString(R.string.dialog_send_ln).format(
+                    prExt.descriptionOpt
+                      .map(expellNameFromNameDesc(_))
+                      .map(desc => s"<br><br>$desc")
+                      .getOrElse("")
+                  )
                 )
                 val builder = titleBodyAsViewBuilder(
                   title.asColoredView(R.color.ourPurple),
@@ -2274,6 +2341,16 @@ class HubActivity
 
                 def fillFlow(value: CharSequence) = UITask {
                   runAnd(title.flow.removeAllViewsInLayout) {
+                    prExt.descriptionOpt
+                      .flatMap(getNameFromNameDesc(_))
+                      .foreach { name =>
+                        addFlowChip(
+                          title.flow,
+                          getString(R.string.popup_ln_namedesc).format(name),
+                          R.drawable.border_white
+                        )
+                      }
+
                     addFlowChip(
                       title.flow,
                       getString(R.string.dialog_ln_requested)
@@ -2327,14 +2404,37 @@ class HubActivity
               override def isNeutralEnabled: Boolean = true
 
               override val alert: AlertDialog = {
-                val title = getString(R.string.dialog_send_ln)
-                  .format(prExt.brDescription)
-                  .asColoredView(R.color.ourPurple)
+                val title = new TitleView(
+                  getString(R.string.dialog_send_ln)
+                    .format(
+                      prExt.descriptionOpt
+                        .map(expellNameFromNameDesc(_))
+                        .map(desc => s"<br><br>$desc")
+                        .getOrElse("")
+                    )
+                )
+                val builder = titleBodyAsViewBuilder(
+                  title.asColoredView(R.color.ourPurple),
+                  manager.content
+                )
+
+                runAnd(title.flow.removeAllViewsInLayout) {
+                  prExt.descriptionOpt
+                    .flatMap(getNameFromNameDesc(_))
+                    .foreach { name =>
+                      addFlowChip(
+                        title.flow,
+                        getString(R.string.popup_ln_namedesc).format(name),
+                        R.drawable.border_white
+                      )
+                    }
+                }
+
                 mkCheckFormNeutral(
                   send,
                   none,
                   neutral,
-                  titleBodyAsViewBuilder(title, manager.content),
+                  builder,
                   R.string.dialog_ok,
                   R.string.dialog_cancel,
                   R.string.dialog_max
@@ -2347,10 +2447,16 @@ class HubActivity
         }
 
       case lnurl: LNUrl =>
-        lnurl.fastWithdrawAttempt.toOption match {
-          case Some(withdraw)       => bringWithdrawPopup(withdraw)
-          case None if lnurl.isAuth => showAuthForm(lnurl)
-          case None                 => resolveLnurl(lnurl)
+        (
+          lnurl.fastWithdrawAttempt.toOption,
+          lnurl.fastHostedChannelAttempt.toOption
+        ) match {
+          case (Some(withdraw), _) =>
+            bringWithdrawPopup(withdraw)
+          case (_, Some(hc)) =>
+            goToWithValue(ClassNames.remotePeerActivityClass, hc)
+          case _ if lnurl.isAuth => showAuthForm(lnurl)
+          case _                 => resolveLnurl(lnurl)
         }
 
       case _ =>
@@ -2395,15 +2501,7 @@ class HubActivity
   }
 
   def showAuthForm(lnurl: LNUrl): Unit = lnurl.k1.foreach { k1 =>
-    val (successResource, actionResource) = lnurl.authAction match {
-      case "register" =>
-        (R.string.lnurl_auth_register_ok, R.string.lnurl_auth_register)
-      case "auth" => (R.string.lnurl_auth_auth_ok, R.string.lnurl_auth_auth)
-      case "link" => (R.string.lnurl_auth_link_ok, R.string.lnurl_auth_link)
-      case _      => (R.string.lnurl_auth_login_ok, R.string.lnurl_auth_login)
-    }
-
-    val authData = LNUrlAuther.make(lnurl.uri.getHost, k1)
+    val authData = LNUrlAuther.make(lnurl.url.hostOption.get.value, k1)
     val title = titleBodyAsViewBuilder(
       s"<big>${lnurl.warnUri}</big>".asColoredView(R.color.ourPurple),
       null
@@ -2413,7 +2511,7 @@ class HubActivity
       none,
       displayInfo,
       title,
-      actionResource,
+      R.string.lnurl_auth_login,
       R.string.dialog_cancel,
       R.string.dialog_info
     )
@@ -2440,15 +2538,16 @@ class HubActivity
         getString(R.string.dialog_lnurl_processing).format(lnurl.warnUri).html,
         R.string.dialog_cancel
       ) foreach { snack =>
-        val uri = lnurl.uri.buildUpon
-          .appendQueryParameter("sig", authData.sig)
-          .appendQueryParameter("key", authData.key)
+        val uri = lnurl.url
+          .addParam("sig", authData.sig)
+          .addParam("key", authData.key)
         val level2Obs = LNUrl
           .level2DataResponse(uri)
           .doOnUnsubscribe(snack.dismiss)
           .doOnTerminate(snack.dismiss)
         val level2Sub = level2Obs.subscribe(
-          _ => UITask(WalletApp.app.quickToast(successResource)).run,
+          _ =>
+            UITask(WalletApp.app.quickToast(R.string.lnurl_auth_login_ok)).run,
           onFail
         )
         val listener = onButtonTap(level2Sub.unsubscribe())
@@ -2534,11 +2633,7 @@ class HubActivity
         WalletApp.ensureTor -> walletCards.torIndicator,
         !WalletApp.isConnected -> walletCards.offlineIndicator
       )
-      walletCards.searchField.addTextChangedListener(
-        onTextChange(
-          searchWorker.addWork
-        )
-      )
+      walletCards.searchField.addTextChangedListener(onTextChange(search))
       runAnd(updateLnCaches())(paymentAdapterDataChanged.run)
       markAsFailedOnce
     }
@@ -2668,7 +2763,7 @@ class HubActivity
 
       def proceed(alert: AlertDialog): Unit = runAnd(alert.dismiss) {
         runInFutureProcessOnUI(
-          InputParser recordValue extraInput.getText.toString,
+          InputParser.recordValue(extraInput.getText.toString),
           onFail
         ) { _ =>
           def attemptProcessInput(): Unit =
@@ -2864,7 +2959,7 @@ class HubActivity
       alert.dismiss
     }
 
-    lazy val feeView = new FeeView[GenerateTxResponse](
+    lazy val feeView = new FeeView(
       FeeratePerByte(1L.sat),
       sendView.chainEditView.host
     ) {
@@ -2872,22 +2967,27 @@ class HubActivity
         LNParams.feeRates.info.onChainFeeConf.feeTargets.mutualCloseBlockTarget
       )
 
-      worker = new ThrottledWork[String, GenerateTxResponse] {
-        // This is a generic sending facility which may send to non-segwit, so always use a safer high dust threshold
-        override def error(exception: Throwable): Unit = update(
-          feeOpt = None,
-          showIssue =
-            sendView.manager.resultMsat >= LNParams.chainWallets.params.dustLimit
-        )
-        def work(reason: String): Observable[GenerateTxResponse] =
-          Rx fromFutureOnIo fromWallet.makeTx(
+      val onChange = firstLast[Unit] { _ =>
+        fromWallet
+          .makeTx(
             chainPubKeyScript,
             sendView.manager.resultMsat.truncateToSatoshi,
             Map.empty,
             rate
           )
-        def process(reason: String, response: GenerateTxResponse): Unit =
-          update(feeOpt = Some(response.fee.toMilliSatoshi), showIssue = false)
+          .onComplete {
+            case Success(res) =>
+              update(
+                feeOpt = Some(res.fee.toMilliSatoshi),
+                showIssue = false
+              )
+            case Failure(_) =>
+              update(
+                feeOpt = None,
+                showIssue =
+                  sendView.manager.resultMsat >= LNParams.chainWallets.params.dustLimit
+              )
+          }
       }
 
       override def update(
@@ -2900,8 +3000,8 @@ class HubActivity
     }
 
     // Automatically update a candidate transaction each time user changes amount value
-    sendView.manager.inputAmount addTextChangedListener onTextChange(
-      feeView.worker.addWork
+    sendView.manager.inputAmount.addTextChangedListener(
+      onTextChange(_ => feeView.onChange(()))
     )
     alert.setOnDismissListener(sendView.onDismissListener)
     feeView.update(feeOpt = None, showIssue = false)
@@ -2999,7 +3099,7 @@ class HubActivity
       alert.dismiss
     }
 
-    lazy val feeView = new FeeView[GenerateTxResponse](
+    lazy val feeView = new FeeView(
       FeeratePerByte(1L.sat),
       sendView.chainEditView.host
     ) {
@@ -3007,13 +3107,16 @@ class HubActivity
         LNParams.feeRates.info.onChainFeeConf.feeTargets.mutualCloseBlockTarget
       )
 
-      worker = new ThrottledWork[String, GenerateTxResponse] {
-        def process(reason: String, response: GenerateTxResponse): Unit =
-          update(feeOpt = Some(response.fee.toMilliSatoshi), showIssue = false)
-        def work(reason: String): Observable[GenerateTxResponse] =
-          Rx fromFutureOnIo fromWallet.makeBatchTx(scriptToAmount, rate)
-        override def error(exception: Throwable): Unit =
-          update(feeOpt = None, showIssue = true)
+      val onChange = firstLast[Unit] { _ =>
+        fromWallet.makeBatchTx(scriptToAmount, rate).onComplete {
+          case Success(res) =>
+            update(
+              feeOpt = Some(res.fee.toMilliSatoshi),
+              showIssue = false
+            )
+          case Failure(_) =>
+            update(feeOpt = None, showIssue = true)
+        }
       }
 
       override def update(
@@ -3037,7 +3140,7 @@ class HubActivity
     setVis(isVisible = false, sendView.chainEditView.inputChain)
     alert.setOnDismissListener(sendView.onDismissListener)
     feeView.update(feeOpt = None, showIssue = false)
-    feeView.worker.addWork("MULTI-SEND-INIT-CALL")
+    feeView.onChange(())
   }
 
   def bringReceivePopup(view: View): Unit =
@@ -3062,10 +3165,15 @@ class HubActivity
           getString(R.string.dialog_receive_ln)
 
         override def getDescription: PaymentDescription = {
-          val invoiceText = manager.resultExtraInput.getOrElse(new String)
           val hold =
             if (manager.holdPayment.isChecked) Some(LNParams.maxHoldSecs)
             else None
+          val namePrefix =
+            if (manager.attachIdentity.isChecked)
+              s"${WalletApp.userName.get}:  "
+            else ""
+          val invoiceText =
+            manager.resultExtraInput.map(namePrefix ++ _).getOrElse("")
           PaymentDescription(
             split = None,
             label = None,
@@ -3077,6 +3185,20 @@ class HubActivity
 
         manager.holdPayment.setText(holdPeriodInMinutes.html)
         setVis(isVisible = true, manager.holdPayment)
+
+        val commentChanged = debounce[String](
+          comment => {
+            UITask {
+              setVis(isVisible = comment.trim.nonEmpty, manager.attachIdentity)
+            }.run
+          },
+          450.milliseconds
+        )
+        WalletApp.userName.foreach { _ =>
+          manager.extraInput.addTextChangedListener(
+            onTextChange(commentChanged)
+          )
+        }
       }
     }
 
@@ -3103,10 +3225,8 @@ class HubActivity
         )
         override def getTitleText: String =
           getString(R.string.dialog_lnurl_withdraw).format(
-            data.callbackUri.getHost,
-            data.descriptionOpt.map(desc =>
-              s"<br><br>$desc"
-            ) getOrElse new String
+            data.callbackUrl.hostOption.get.value,
+            data.descriptionOpt.map(desc => s"<br><br>$desc").getOrElse("")
           )
         override def processInvoice(prExt: PaymentRequestExt): Unit =
           data.requestWithdraw(prExt).foreach(none, onFail)
@@ -3141,7 +3261,7 @@ class HubActivity
         snack(
           contentWindow,
           getString(R.string.dialog_lnurl_splitting)
-            .format(data.callbackUri.getHost)
+            .format(data.callbackUrl.hostOption.get.value)
             .html,
           R.string.dialog_cancel
         ) foreach { snack =>
@@ -3197,7 +3317,7 @@ class HubActivity
         snack(
           contentWindow,
           getString(R.string.dialog_lnurl_sending)
-            .format(amountHuman, data.callbackUri.getHost)
+            .format(amountHuman, data.callbackUrl.hostOption.get.value)
             .html,
           R.string.dialog_cancel
         ) foreach { snack =>
@@ -3245,7 +3365,7 @@ class HubActivity
             if (!pf.isThrowAway) {
               WalletApp.lnUrlPayBag.saveLink(
                 LNUrlPayLink(
-                  domain = lnurl.uri.getHost,
+                  domain = lnurl.url.hostOption.get.value,
                   payString = lnurl.request,
                   data.metadata,
                   updatedAt = System.currentTimeMillis,
@@ -3270,8 +3390,8 @@ class HubActivity
 
       override val alert: AlertDialog = {
         val text = getString(R.string.dialog_lnurl_pay).format(
-          data.callbackUri.getHost,
-          s"<br><br>${data.meta.textShort}"
+          data.callbackUrl.hostOption.get.value,
+          s"<br><br>${data.meta.textShort.getOrElse("")}"
         )
         val title = titleBodyAsViewBuilder(
           text.asColoredView(R.color.ourPurple),
@@ -3292,17 +3412,33 @@ class HubActivity
         amount = amount,
         comment = Some(getComment),
         randomKey = Some(randKey.publicKey),
+        name =
+          if (manager.attachIdentity.isChecked) WalletApp.userName else None,
         authKeyHost =
-          if (manager.attachIdentity.isChecked) Some(lnurl.uri.getHost)
+          if (manager.attachIdentity.isChecked)
+            Some(lnurl.url.hostOption.get.value)
           else None
       )
 
       manager.updateText(minSendable)
       data.payerData.foreach { payerDataSpec =>
-        payerDataSpec.auth.foreach { authSpec =>
-          manager.attachIdentity.setChecked(authSpec.mandatory)
-          manager.attachIdentity.setEnabled(!authSpec.mandatory)
+        val enabled =
+          List(
+            payerDataSpec.name.isDefined && WalletApp.userName.isDefined,
+            payerDataSpec.auth.isDefined,
+            payerDataSpec.pubkey.isDefined
+          ).exists(_ == true)
+        val mandatory =
+          List(
+            payerDataSpec.name.map(_.mandatory).getOrElse(false),
+            payerDataSpec.auth.map(_.mandatory).getOrElse(false),
+            payerDataSpec.pubkey.map(_.mandatory).getOrElse(false)
+          ).exists(_ == true)
+
+        if (enabled) {
           setVis(isVisible = true, manager.attachIdentity)
+          manager.attachIdentity.setChecked(mandatory)
+          manager.attachIdentity.setEnabled(!mandatory)
         }
       }
 

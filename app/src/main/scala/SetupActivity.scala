@@ -125,12 +125,12 @@ class SetupActivity extends BaseActivity {
             )
             // Delete user-selected backup file while we can here and make an app-owned backup shortly
             DocumentFile.fromSingleUri(this, resultData.getData).delete
-            WalletApp.backupSaveWorker.replaceWork(true)
+            WalletApp.immediatelySaveBackup()
             proceedWithMnemonics(mnemonics)
 
-          case Failure(exception) =>
+          case Failure(exc) =>
             val msg = getString(R.string.error_could_not_decrypt)
-            onFail(msg format exception.getMessage)
+            onFail(msg.format(exc.getMessage))
         }
       }
     }

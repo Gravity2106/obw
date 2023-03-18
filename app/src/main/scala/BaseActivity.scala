@@ -283,8 +283,10 @@ trait BaseActivity extends AppCompatActivity { self =>
     for (isVisible ~ view <- items) setVis(isVisible, view)
   }
 
+  def isVisible(view: View): Boolean = view.getVisibility == View.VISIBLE
+
   def runDelayed(ms: Int)(fun: => Any): Unit =
-    timer.schedule(UITask(fun), ms)
+    timer.schedule(UITask(fun), ms.toLong)
 
   def UITask(fun: => Any): java.util.TimerTask = {
     val runnableExec = new Runnable { override def run(): Unit = fun }
@@ -620,7 +622,7 @@ trait BaseActivity extends AppCompatActivity { self =>
     firstItem.setText(firstText)
   }
 
-  class FeeView[T](from: FeeratePerByte, val content: View) {
+  abstract class FeeView(from: FeeratePerByte, val content: View) {
     val feeRate: TextView =
       content.findViewById(R.id.feeRate).asInstanceOf[TextView]
     val txIssues: TextView =
@@ -634,13 +636,16 @@ trait BaseActivity extends AppCompatActivity { self =>
       content.findViewById(R.id.customFeerate).asInstanceOf[Slider]
     val customFeerateOption: TextView =
       content.findViewById(R.id.customFeerateOption).asInstanceOf[TextView]
-    var worker: ThrottledWork[String, T] = _
     var rate: FeeratePerKw = _
 
+    val onChange: Unit => Unit
     def update(feeOpt: Option[MilliSatoshi], showIssue: Boolean): Unit = {
-      feeRate setText getString(R.string.dialog_fee_sat_vbyte)
-        .format(FeeratePerByte(rate).feerate.toLong)
-        .html
+      feeRate.setText(
+        getString(R.string.dialog_fee_sat_vbyte)
+          .format(FeeratePerByte(rate).feerate.toLong)
+          .html
+      )
+
       setVisMany(
         feeOpt.isDefined -> bitcoinFee,
         feeOpt.isDefined -> fiatFee,
@@ -676,7 +681,7 @@ trait BaseActivity extends AppCompatActivity { self =>
       ): Unit = {
         val feeratePerByte = FeeratePerByte(value.toLong.sat)
         rate = FeeratePerKw(feeratePerByte)
-        worker.addWork("SLIDER-CHANGE")
+        onChange(())
       }
     })
   }
@@ -1105,10 +1110,10 @@ trait BaseActivity extends AppCompatActivity { self =>
       getString(R.string.dialog_up_to).format(canSendHuman).html
     )
 
-    manager.inputAmount addTextChangedListener onTextChange { _ =>
+    manager.inputAmount.addTextChangedListener(onTextChange { _ =>
       updatePopupButton(getNeutralButton(alert), isNeutralEnabled)
       updatePopupButton(getPositiveButton(alert), isPayEnabled)
-    }
+    })
 
     def neutral(alert: AlertDialog): Unit
     def send(alert: AlertDialog): Unit
@@ -1238,14 +1243,14 @@ trait BaseActivity extends AppCompatActivity { self =>
       )
     }
 
-    manager.inputAmount addTextChangedListener onTextChange { _ =>
+    manager.inputAmount.addTextChangedListener(onTextChange { _ =>
       val withinBounds =
         finalMinReceivable <= manager.resultMsat && finalMaxReceivable >= manager.resultMsat
       updatePopupButton(
         button = getPositiveButton(alert),
         isEnabled = withinBounds
       )
-    }
+    })
 
     manager.hintFiatDenom.setText(
       getString(R.string.dialog_up_to).format(canReceiveFiatHuman).html
@@ -1266,10 +1271,9 @@ trait BaseCheckActivity extends BaseActivity {
   def PROCEED(state: Bundle): Unit
 
   override def onCreate(savedActivityState: Bundle): Unit = {
+    super.onCreate(savedActivityState)
     if (!LNParams.isOperational)
       exitTo(ClassNames.mainActivityClass)
-    else
-      super.onCreate(savedActivityState)
   }
 
   override def onResume(): Unit = runAnd(super.onResume) {
@@ -1338,7 +1342,7 @@ trait ChanErrorHandlerActivity extends BaseCheckActivity {
     if (errorCount >= MAX_ERROR_COUNT_WITHIN_WINDOW) return
 
     def break(alert: AlertDialog): Unit = runAnd(alert.dismiss)(
-      worker requestRemoteForceClose reestablish.channelId
+      worker.requestRemoteForceClose(reestablish.channelId)
     )
     val msg = getString(R.string.error_channel_unknown)
       .format(

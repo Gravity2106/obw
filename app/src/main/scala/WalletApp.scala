@@ -15,19 +15,11 @@ import android.widget.{EditText, Toast}
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.multidex.MultiDex
 import androidx.security.crypto.{EncryptedSharedPreferences, MasterKeys}
-import wtf.nbd.obw.BaseActivity.StringOps
-import wtf.nbd.obw.R
-import wtf.nbd.obw.sqlite._
-import wtf.nbd.obw.utils.{
-  OkHttpConnectionProvider,
-  AwaitService,
-  DelayedNotification,
-  LocalBackup
-}
 import com.guardanis.applock.AppLock
 import com.softwaremill.quicklens._
 import fr.acinq.bitcoin.{Block, ByteVector32, Satoshi, SatoshiLong}
 import fr.acinq.eclair._
+import fr.acinq.eclair.blockchain.electrum.ElectrumClient.SSL
 import fr.acinq.eclair.blockchain.electrum.ElectrumWallet.{
   TransactionReceived,
   WalletReady
@@ -51,12 +43,26 @@ import immortan._
 import immortan.crypto.Tools._
 import immortan.sqlite._
 import immortan.utils._
-import rx.lang.scala.Observable
 import scodec.bits.BitVector
 import castor.Context.Simple.global
 
+import wtf.nbd.obw.BaseActivity.StringOps
+import wtf.nbd.obw.R
+import wtf.nbd.obw.sqlite._
+import wtf.nbd.obw.utils.{
+  OkHttpConnectionProvider,
+  AwaitService,
+  DelayedNotification,
+  LocalBackup,
+  firstLast,
+  debounce
+}
+
 object WalletApp {
-  LNParams.chainHash = Block.LivenetGenesisBlock.hash
+  LNParams.chainHash = BuildConfig.CHAIN match {
+    case "signet" => Block.SignetGenesisBlock.hash
+    case _        => Block.LivenetGenesisBlock.hash
+  }
 
   var chainWalletBag: SQLiteChainWallet = _
   var extDataBag: SQLiteDataExtended = _
@@ -75,31 +81,28 @@ object WalletApp {
   final val dbFileNameGraph = "graph.db"
   final val dbFileNameEssential = "essential.db"
 
-  val backupSaveWorker: ThrottledWork[Boolean, Any] =
-    new ThrottledWork[Boolean, Any] {
-      private def doAttemptStore(): Unit =
+  val immediatelySaveBackup = firstLast[Unit](_ => {
+    if (LocalBackup.isAllowed(app)) {
+      try
         LocalBackup.encryptAndWritePlainBackup(
           app,
           dbFileNameEssential,
           LNParams.chainHash,
           LNParams.secret.seed
         )
-      def process(useDelay: Boolean, unitAfterDelay: Any): Unit = if (
-        LocalBackup isAllowed app
-      )
-        try doAttemptStore()
-        catch none
-      def work(useDelay: Boolean): Observable[Any] =
-        if (useDelay) Rx.ioQueue.delay(4.seconds) else Observable.just(null)
+      catch none
     }
+  })
 
   final val FIAT_CODE = "fiatCode"
   final val BTC_DENOM = "btcDenom"
+  final val USER_NAME = "userName"
   final val ENSURE_TOR = "ensureTor"
   final val MAXIMIZED_VIEW = "maximizedView"
   final val LAST_TOTAL_GOSSIP_SYNC = "lastTotalGossipSync"
   final val LAST_NORMAL_GOSSIP_SYNC = "lastNormalGossipSync"
   final val CUSTOM_ELECTRUM_ADDRESS = "customElectrumAddress"
+  final val CUSTOM_ELECTRUM_SSL = "customElectrumSSL"
 
   def useAuth: Boolean = AppLock.isEnrolled(app)
   def fiatCode: String = app.prefs.getString(FIAT_CODE, "usd")
@@ -137,10 +140,20 @@ object WalletApp {
     if (denom == SatDenomination.sign) SatDenomination else BtcDenomination
   }
 
-  def customElectrumAddress: Try[NodeAddress] = Try {
+  def userName: Option[String] = Option(app.prefs.getString(USER_NAME, null))
+
+  def customElectrumAddress: Option[(NodeAddress, Option[SSL])] = Try {
     val rawAddress = app.prefs.getString(CUSTOM_ELECTRUM_ADDRESS, "")
-    nodeaddress.decode(BitVector.fromValidHex(rawAddress)).require.value
-  }
+    val address =
+      nodeaddress.decode(BitVector.fromValidHex(rawAddress)).require.value
+    val ssl = app.prefs.getString(CUSTOM_ELECTRUM_SSL, "") match {
+      case "strict" => Some(SSL.STRICT)
+      case "loose"  => Some(SSL.LOOSE)
+      case "off"    => Some(SSL.OFF)
+      case _        => None
+    }
+    (address, ssl)
+  }.toOption
 
   def freePossiblyUsedRuntimeResouces(): Unit = {
     // Drop whatever network connections we still have
@@ -196,13 +209,13 @@ object WalletApp {
           override def put(
               data: PersistentChannelData
           ): PersistentChannelData = {
-            backupSaveWorker.replaceWork(true)
+            immediatelySaveBackup()
             super.put(data)
           }
         }
     }
 
-    extDataBag.db txWrap {
+    extDataBag.db.txWrap {
       LNParams.feeRates = new FeeRates(extDataBag)
       LNParams.fiatRates = new FiatRates(extDataBag)
       payBag = new SQLitePayment(extDataBag.db, preimageDb = essentialInterface)
@@ -247,7 +260,7 @@ object WalletApp {
       LNParams.blockCount,
       LNParams.chainHash,
       ensureTor,
-      customElectrumAddress.toOption
+      customElectrumAddress
     )
     val sync = new ElectrumChainSync(
       pool,
@@ -560,11 +573,11 @@ object Vibrator {
     vibrator.vibrate(android.os.VibrationEffect.createOneShot(85, -1))
 }
 
-class WalletApp extends Application { me =>
-  WalletApp.app = me
+class WalletApp extends Application { app =>
+  WalletApp.app = app
 
   lazy val foregroundServiceIntent =
-    new Intent(me, AwaitService.awaitServiceClass)
+    new Intent(app, AwaitService.awaitServiceClass)
   lazy val prefs: SharedPreferences =
     getSharedPreferences("prefs", Context.MODE_PRIVATE)
 
@@ -577,7 +590,7 @@ class WalletApp extends Application { me =>
   lazy val tooFewSpace: Boolean =
     getFloat(getContentResolver, FONT_SCALE, 1) > 1 && scrWidth < 2.4
 
-  lazy val dateFormat: SimpleDateFormat = DateFormat.is24HourFormat(me) match {
+  lazy val dateFormat: SimpleDateFormat = DateFormat.is24HourFormat(app) match {
     case false if tooFewSpace => new SimpleDateFormat("MM/dd/yy")
     case true if tooFewSpace  => new SimpleDateFormat("dd/MM/yy")
     case false                => new SimpleDateFormat("MMM dd, yyyy")
@@ -603,7 +616,7 @@ class WalletApp extends Application { me =>
 
   override def attachBaseContext(base: Context): Unit = {
     super.attachBaseContext(base)
-    MultiDex.install(me)
+    MultiDex.install(app)
   }
 
   override def onCreate(): Unit = {
@@ -636,7 +649,7 @@ class WalletApp extends Application { me =>
         500.millis
       ).foreach { _ =>
         // This might be the last channel state update which clears all in-flight HTLCs
-        DelayedNotification.cancel(me, DelayedNotification.IN_FLIGHT_HTLC_TAG)
+        DelayedNotification.cancel(app, DelayedNotification.IN_FLIGHT_HTLC_TAG)
         if (LNParams.cm.channelsContainHtlc) WalletApp.reScheduleInFlight()
       }
     }
@@ -644,7 +657,7 @@ class WalletApp extends Application { me =>
 
   override def onTrimMemory(level: Int): Unit = {
     val shouldResetUnlock = level == ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN
-    if (shouldResetUnlock) AppLock.getInstance(me).setAuthenticationRequired
+    if (shouldResetUnlock) AppLock.getInstance(app).setAuthenticationRequired
     super.onTrimMemory(level)
   }
 
@@ -669,7 +682,7 @@ class WalletApp extends Application { me =>
   ): Unit = {
     val withTitle = foregroundServiceIntent.putExtra(
       AwaitService.TITLE_TO_DISPLAY,
-      me getString titleRes
+      app.getString(titleRes)
     )
     val bodyText = getString(bodyRes).format(
       WalletApp.denom
@@ -680,12 +693,12 @@ class WalletApp extends Application { me =>
       .putExtra(AwaitService.BODY_TO_DISPLAY, bodyText)
       .setAction(AwaitService.ACTION_SHOW)
     androidx.core.content.ContextCompat
-      .startForegroundService(me, withBodyAction)
+      .startForegroundService(app, withBodyAction)
   }
 
   def quickToast(code: Int): Unit = quickToast(getString(code))
   def quickToast(msg: CharSequence): Unit =
-    Toast.makeText(me, msg, Toast.LENGTH_LONG).show
+    Toast.makeText(app, msg, Toast.LENGTH_LONG).show
   def plurOrZero(num: Long, opts: Array[String] = Array.empty): String =
     if (num > 0) plur(opts, num).format(num) else opts(0)
   def clipboardManager: ClipboardManager = getSystemService(
